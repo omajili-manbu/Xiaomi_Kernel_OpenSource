@@ -6,7 +6,7 @@
 [![SuSFS](https://img.shields.io/badge/Hiding-SuSFS-green)](https://gitlab.com/simonpunk/susfs4ksu)
 [![License](https://img.shields.io/badge/license-GPL--2.0-lightgrey)](LICENSES)
 
-[English](README.md) | 简体中文 | [一些构建经验](BUILD-GUIDE.md)
+[English](README.md) | 简体中文
 
 基于小米已开源的 [`bsp-rodin-v-oss`](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/bsp-rodin-v-oss) 内核源码（AOSP `android15-6.6` GKI / 联发科）构建的 rodin 设备增强内核，并持续跟进最新 **6.6 LTS**。
 
@@ -53,6 +53,7 @@
 
 ## 下载与支持
 
+- [一些构建经验](BUILD-GUIDE.md)
 - 预编译镜像：[Releases](https://github.com/omajili-manbu/Xiaomi_Rodin_Kernel_Enhance/releases)
 - 问题反馈：请携带内核日志开 [issue](https://github.com/omajili-manbu/Xiaomi_Rodin_Kernel_Enhance/issues)
 - 如果你觉得这个项目不错，欢迎点个 Star 支持我！
