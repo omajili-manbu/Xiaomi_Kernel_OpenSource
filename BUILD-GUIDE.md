@@ -6,90 +6,14 @@
 
 # 生成 .config 的经验指南（Rodin / Xiaomi_Rodin_Kernel_Enhance）
 
-本指南总结在用 `defconfig + gki_defconfig` 重新生成 `.config` 并基于 clang22 全量编内核时踩过的坑与解法，供以后复用，避免重复踩坑。
+本指南总结在用 `.config` 并基于 clang22 全量编内核时踩过的坑与解法，供以后复用，避免重复踩坑。
 
 适用内核树：`~/rodin-build/kernel-rodin-merge`（Xiaomi Rodin 6.6.x 分支 `bsp-rodin-kernel-oss-bp`）
 编译器：Android 预编译 clang22：`$HOME/rodin-build/prebuilts/clang/host/linux-x86/clang-r596125/bin`
 
----
+### 只能用 gki_defconfig 生成用于编译的 .config ，而不是 defconfig + gki_defconfig 或者其他的组合，否则会生成错误配置！
 
-## 1. 推荐的 config 生成与锁choice流程
-
-Kconfig 的 `merge_config.sh` 之后会做“求解/重整”，**会清掉依赖不满足的符号、并把“无显式选择”的 `choice` 落回默认成员**。因此不要“merge 完就跑”，要**先求解、再锁定关键 choice、再 syncconfig**：
-
-```bash
-cd ~/rodin-build/kernel-rodin-merge
-
-# 基准 defconfig + 叠加 gki_defconfig 合并
-scripts/kconfig/merge_config.sh -O .
-
-# 关键：merge 的求解会把 LTO 这个 choice 拽回默认 LTO_NONE
-# 用 scripts/config 显式锁定，避免被覆盖
-./scripts/config --enable LTO_CLANG_THIN   # 同时自动让 LTO_NONE/LTO_CLANG_FULL 变 n
-./scripts/config --enable AUTOFDO_CLANG    # AutoFDO
-./scripts/config --enable CFI_CLANG        # 若需要 CFI
-./scripts/config --enable CFI_PERMISSIVE
-./scripts/config --set-str CONFIG_LOCALVERSION "-by-Omachirimanbu-4k"   # 若需 localversion
-./scripts/config --set-val CONFIG_FRAME_WARN 4096                        # 见 §3
-
-# 用 syncconfig 物化 include/config 派生头文件（不要再跑 olddefconfig！会冲掉锁定项）
-make ARCH=arm64 LLVM=1 syncconfig
-```
-
-> `syncconfig` vs `olddevconfig` 区别：
-> - `olddefconfig`=“重新求解 `.config`（填默认值）”，会覆盖未被显式指定的符号、把 choice 落回默认 → **会把 LTO 冲掉，别在 merge 后用它**。
-> - `syncconfig`=“把当前 `.config` 物化成 `include/config/auto.conf`、`autoconf.h` 等”，不动你的选择。
-> 日常 `make` 内部自动跑的是 `syncconfig`。
-
----
-
-## 2. LTO 为何容易变成 LTO_NONE
-
-内核 `LTO_CLANG_*` 是一个 `choice`（单选互斥），其 `default` 成员是 `LTO_NONE`。
-
-- `defconfig`（基准仓）通常**不设置任何 LTO 选项**；
-- `merge_config.sh` 求解时若“没有任何成员被显式且依赖满足地选中”，choice 就会收敛到默认成员 **`LTO_NONE=y`**；
-- 于是即便 `gki_defconfig` 里写了 `LTO_CLANG_THIN=y`，也可能被冲掉。
-
-解法就是上面用 `scripts/config --enable LTO_CLANG_THIN` 显式锁定，再用 `syncconfig` 物化，顺序别反。
-
----
-
-## 3. clang22 下 WERROR 与栈帧告警
-
-新版 clang 会把 `-Wframe-larger-than` 在 `CONFIG_WERROR=y` 时把栈帧超限当成 error（如 `lib/crypto/curve25519-hacl64.c`、`drivers/block/loop.c` 栈帧 2592/2740 > 默认 2048）。
-
-解法（保留 WERROR 完整检查、仅放宽栈帧上限）：
-```
-CONFIG_FRAME_WARN=4096
-```
-配合 `./scripts/config --set-val CONFIG_FRAME_WARN 4096`。
-
----
-
-## 4. AutoFDO（编译层面验证是否生效）
-
-- 打开：`CONFIG_AUTOFDO_CLANG=y` + `CONFIG_LTO_CLANG_THIN=y`。
-- 内核会 `include scripts/Makefile.autofdo`，并默认用树内 profile `android/gki/aarch64/afdo/kernel.afdo`。
-- 验证是否生效：用 `V=1` 重新编译单个对象看命令行是否含：
-  ```
-  -fprofile-sample-use=./android/gki/aarch64/afdo/kernel.afdo
-  -fdebug-info-for-profiling
-  -mllvm -enable-fs-discriminator=true
-  ```
-- 注意：默认 profile 是 **Google android15-6.6 GKI** 的；对 Rodin 特有代码收益有限但不会报错。要用专属 profile 请自采样 `.afdo` 后 `CLANG_AUTOFDO_PROFILE=xxx` 重编。
-- `strings vmlinux | grep profile` 查不到是正常的（`-fprofile-sample-use` 不把字符串嵌进最终镜像），不能以此判断失效。
-
----
-
-## 5. 编译相关的小patch（这些改动已提交到 bsp-rodin-v-oss-bp）
-
-| 改动 | 文件 | 原因 |
-|---|---|---|
-| `#include <linux/sched/task_stack.h>` | `drivers/kernelsu/feature/adb_root.c` | LTO(clang22)下 `undefined symbol: task_stack_page`（static inline 未内联成外部符号）；引入该头可在 TU 内内联。**不要直接去 static/加 extern**，会引入 duplicate symbol。 |
-| `fanotify_fdinfo` 增加 3 参回调变体（`CONFIG_KSU_SUSFS_SUS_MOUNT`） | `fs/notify/fdinfo.c` | SUSFS 打开后 fanotify 回调用旧 2 参，与 3 参回调不匹配编译失败（参考 inotify 写法）。 |
-
-## 6. 编译命令模板
+## 编译命令模板
 
 ```bash
 export PATH="$HOME/rodin-build/prebuilts/clang/host/linux-x86/clang-r596125/bin:$PATH"
@@ -101,17 +25,6 @@ make ARCH=arm64 LLVM=1 -j8 Image Image.lz4
 - 验证 lz4 legacy：`xxd arch/arm64/boot/Image.lz4 | head -1` 魔数应为 `0221 4c18`（`0x184C2102`），即 LZ4 Legacy，**不是** `0422 4d18`（标准帧格式）。
 - 版本号在 `include/config/kernel.release`。
 
----
-
-## 常见坑速查
-
-| 现象 | 原因 | 解决 |
-|---|---|---|
-| merge 后大量 defconfig 符号消失 | Kconfig 求解按依赖裁剪（ARCH_QCOM/TEGRA/SUNXI 等置 n ⇒ 其驱动符号一起没了） | 正常现象，不追回；若需要某驱动就把其 `CONFIG_*` 与父 `ARCH_*` 一起 `scripts/config --enable` |
-| LTO 变成 NONE | choice 默认成员 | `scripts/config --enable LTO_CLANG_THIN` 后 `syncconfig` |
-| clang 栈帧超限编不过 | clang22 + WERROR | `CONFIG_FRAME_WARN=4096` |
-| `task_stack_page` 未定义 | adb_root.c 未含头文件 | 顶部加 include |
-| SUSFS 下 fdinfo 编译失败 | fanotify 回调签名不匹配 | fdinfo.c 补 3 参分支 |
 
 > 最后更新：2026-09-10
 
