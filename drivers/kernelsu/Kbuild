@@ -79,13 +79,13 @@ KSU_COMMIT_SHA  := $(KSU_COMMIT_SHA)-dirty
 endif
 KSU_BRANCH_NAME := $(shell cd $(KSU_SRC); $(GIT_BIN) branch --show-current 2>/dev/null || echo "unknown")
 else
-# Vendored in-tree copy of ReSukiSU main-susfs @ 0b5efe9e. Do NOT query git
+# Vendored as an in-tree copy of ReSukiSU main-susfs @ 23a40c0f. Do NOT query git
 # here: this directory lives inside the kernel git repository, so rev-list,
 # rev-parse and diff-index would silently report the kernel tree history and
 # leak its commit count, sha and dirty state into the ReSukiSU version info.
-KSU_LOCAL_VERSION := 4414
+KSU_LOCAL_VERSION := 4427
 KSU_TAG_NAME    := v4.2.0-rc1
-KSU_COMMIT_SHA  := 0b5efe9e
+KSU_COMMIT_SHA  := 23a40c0f
 KSU_BRANCH_NAME := main-susfs
 endif
 KSU_VERSION := $(shell expr 30000 + $(KSU_LOCAL_VERSION) + 700)
@@ -174,7 +174,7 @@ ifdef CONFIG_KSU_TRACEPOINT_HOOK
       $(info -- Current Kernel Type: $(KERNEL_TYPE))
       $(info -- If you really want to continue, go to Kbuild and comment out this warning.)
       $(info -- Usually, this error occurs because you forgot to enable some kernel configurations.)
-      $(info -- Read: https://resukisu.github.io/guide/manual-integrate.html)
+      $(info -- Read: https://resukisu.org/guide/manual-integrate.html)
       $(error TP hooks are incompatible with Non-GKI/GKI 1.0 kernels.)
     endif
   endif
