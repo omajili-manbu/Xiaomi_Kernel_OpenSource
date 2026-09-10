@@ -1,4 +1,8 @@
-> [ReSukiSU-SUSFS 落地内核树指南](#ReSukiSU-SUSFS 落地内核树指南)
+> 📚 本篇收录两篇指南（可用 TOC 快速跳转）：
+> - [① 生成 .config 的经验指南（编译：defconfig + gki_defconfig / clang22）](#guide-config)
+> - [② ReSukiSU-SUSFS 落地内核树指南：头文件重建与版本号计算](#guide-susfs)
+
+<a name="guide-config"></a>
 
 # 生成 .config 的经验指南（Rodin / Xiaomi_Rodin_Kernel_Enhance）
 
@@ -109,7 +113,11 @@ make ARCH=arm64 LLVM=1 -j8 Image Image.lz4
 | `task_stack_page` 未定义 | adb_root.c 未含头文件 | 顶部加 include |
 | SUSFS 下 fdinfo 编译失败 | fanotify 回调签名不匹配 | fdinfo.c 补 3 参分支 |
 
+> 最后更新：2026-09-10
+
 ---
+
+<a name="guide-susfs"></a>
 
 # ReSukiSU-SUSFS 落地内核树指南：头文件重建与版本号计算
 
@@ -353,3 +361,5 @@ grep -n 'KSU_VERSION\|KSU_LOCAL_VERSION\|KSU_TAG_NAME\|KSU_COMMIT_SHA\|KSU_BRANC
 | KSU_LOCAL_VERSION | `4427` |
 | KSU_VERSION（固定值） | `35127` |
 | 落地提交 | `a5724993c054` |
+
+> 最后更新：2026-09-10
