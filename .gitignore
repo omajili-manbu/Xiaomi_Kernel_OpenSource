@@ -169,3 +169,6 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# Local build helper (keep local only)
+/gen-rodin-config.sh
