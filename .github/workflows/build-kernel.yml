@@ -1,0 +1,142 @@
+name: build-kernel
+
+# 手动触发的 rodin 内核构建（参考 ABK build.yml 的核心编译流程裁剪）：
+#   clang-r596125 -> gki_defconfig -> Image + Image.lz4 (LZ4 legacy)
+#   -> AnyKernel3 可刷包（内置 Image.lz4）
+#   + 与内核树 drivers/kernelsu 落地版本一致的 ReSukiSU 管理器
+#     （取 ReSukiSU/ReSukiSU main 分支 Build Manager CI 产物：release + spoofed）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  KERNEL_BRANCH: bsp-rodin-v-oss-bp
+  CLANG_VER: clang-r596125
+  CLANG_BRANCH: mirror-goog-llvm-r596125-release
+  RSU_REPO: ReSukiSU/ReSukiSU
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KERNEL_BRANCH }}
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flex bison bc libelf-dev libssl-dev dwarves lz4
+
+      - name: Download clang-r596125
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/clang"
+          if curl -fL --retry 3 \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${CLANG_BRANCH}/${CLANG_VER}.tar.gz" \
+              -o "$RUNNER_TEMP/clang.tgz"; then
+            tar -xzf "$RUNNER_TEMP/clang.tgz" -C "$RUNNER_TEMP/clang"
+          else
+            echo "::warning::clang tarball download failed, falling back to sparse git clone"
+            git clone --depth=1 --filter=blob:none --sparse -b "$CLANG_BRANCH" \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+              "$RUNNER_TEMP/clang-src"
+            git -C "$RUNNER_TEMP/clang-src" sparse-checkout set "$CLANG_VER"
+            mv "$RUNNER_TEMP/clang-src/$CLANG_VER" "$RUNNER_TEMP/clang"
+          fi
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/clang/bin/clang" --version
+
+      - name: Build kernel (gki_defconfig -> Image + Image.lz4)
+        run: |
+          set -euo pipefail
+          # BUILD-GUIDE.md：只能用 gki_defconfig 生成用于编译的 .config
+          make ARCH=arm64 LLVM=1 gki_defconfig
+          make ARCH=arm64 LLVM=1 -j"$(nproc --all)" Image Image.lz4
+          # 校验 LZ4 legacy 魔数 0x184C2102（BUILD-GUIDE.md 要求）
+          MAGIC=$(xxd -p -l4 arch/arm64/boot/Image.lz4)
+          [ "$MAGIC" = "02214c18" ] || { echo "::error::Image.lz4 is not lz4 legacy (magic: $MAGIC)"; exit 1; }
+          KERNEL_RELEASE=$(cat include/config/kernel.release)
+          echo "KERNEL_RELEASE=$KERNEL_RELEASE" >> "$GITHUB_ENV"
+
+      - name: Package AnyKernel3 flashable zip
+        run: |
+          set -euo pipefail
+          git clone --depth=1 -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git
+          rm -rf AnyKernel3/.git
+          cp arch/arm64/boot/Image.lz4 AnyKernel3/Image.lz4
+          sed -i "s|^kernel.string=.*|kernel.string=Rodin ${KERNEL_RELEASE} (ReSukiSU)|" AnyKernel3/anykernel.sh
+          ( cd AnyKernel3 && zip -r9 "../Rodin-${KERNEL_RELEASE}-AnyKernel3.zip" . )
+
+      - name: Fetch matching ReSukiSU manager APKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # sync-resukisu 落地时固定在 drivers/kernelsu/Kbuild 里的 ReSukiSU commit
+          RSU_SHA=$(grep -E '^KSU_COMMIT_SHA[[:space:]]*:= *[0-9a-f]{8}[[:space:]]*$' drivers/kernelsu/Kbuild | head -n1 | awk '{print $3}')
+          echo "landed ReSukiSU commit: ${RSU_SHA:-<none>}"
+          mkdir -p manager-apk
+
+          fetch_apks() { # $1 = ReSukiSU CI run id
+            rm -rf manager-apk && mkdir -p manager-apk
+            for name in Manager-release Spoofed-Manager-release; do
+              local art
+              art=$(gh api "repos/$RSU_REPO/actions/runs/$1/artifacts?per_page=100" \
+                    --jq ".artifacts[] | select(.name==\"$name\" and .expired==false) | .id" | head -n1)
+              [ -n "$art" ] || return 1
+              gh api "repos/$RSU_REPO/actions/artifacts/$art/zip" > "$name.zip"
+              unzip -oq "$name.zip" -d manager-apk
+            done
+          }
+
+          RUN_ID=""
+          if [ -n "$RSU_SHA" ]; then
+            for cand in $(gh api "repos/$RSU_REPO/actions/workflows/build-manager.yml/runs?branch=main&status=success&per_page=100" \
+                          --jq ".workflow_runs[] | select(.head_sha | startswith(\"$RSU_SHA\")) | .id"); do
+              echo "trying run $cand (matches landed ReSukiSU commit)"
+              RUN_ID="$cand"; fetch_apks "$cand" && break || RUN_ID=""
+            done
+          fi
+          if [ -z "$RUN_ID" ]; then
+            echo "::warning::no artifacts for ReSukiSU commit ${RSU_SHA:-unknown} - falling back to latest successful main build"
+            for cand in $(gh api "repos/$RSU_REPO/actions/workflows/build-manager.yml/runs?branch=main&status=success&per_page=10" --jq '.workflow_runs[].id'); do
+              echo "trying latest run $cand"
+              RUN_ID="$cand"; fetch_apks "$cand" && break || RUN_ID=""
+            done
+          fi
+          [ -n "$RUN_ID" ] || { echo "::error::no usable ReSukiSU Build Manager artifacts found"; exit 1; }
+          echo "RSU_RUN_URL=https://github.com/$RSU_REPO/actions/runs/$RUN_ID" >> "$GITHUB_ENV"
+          ls -la manager-apk
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rodin-${{ env.KERNEL_RELEASE }}
+          path: |
+            Rodin-*-AnyKernel3.zip
+            manager-apk/*.apk
+          if-no-files-found: error
+
+      - name: Build summary
+        run: |
+          {
+            echo "### Rodin kernel build"
+            echo "- kernel: \`${KERNEL_RELEASE}\` (Image.lz4 = lz4 legacy, magic 02214c18 verified)"
+            echo "- AK3 flashable zip: \`Rodin-${KERNEL_RELEASE}-AnyKernel3.zip\`"
+            echo "- ReSukiSU manager: \`Manager-release\` + \`Spoofed-Manager-release\` from [CI run]($RSU_RUN_URL)"
+          } >> "$GITHUB_STEP_SUMMARY"
