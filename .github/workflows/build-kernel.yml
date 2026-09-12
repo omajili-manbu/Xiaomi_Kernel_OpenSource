@@ -102,7 +102,7 @@ jobs:
           KERNEL_RELEASE=$(cat include/config/kernel.release)
           echo "KERNEL_RELEASE=$KERNEL_RELEASE" >> "$GITHUB_ENV"
 
-      - name: Package AnyKernel3 flashable zip
+      - name: Prepare AnyKernel3 flashable tree
         run: |
           set -euo pipefail
           git clone --depth=1 -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git
@@ -110,7 +110,7 @@ jobs:
           # 设备启动只认名为 Image 的 blob；内容为 lz4 legacy 压缩的内核
           cp arch/arm64/boot/Image.lz4 AnyKernel3/Image
           sed -i "s|^kernel.string=.*|kernel.string=Rodin ${KERNEL_RELEASE} (ReSukiSU)|" AnyKernel3/anykernel.sh
-          ( cd AnyKernel3 && zip -r9 "../Rodin-${KERNEL_RELEASE}-AnyKernel3.zip" . )
+          # 不再打包外层 zip：artifact 下载下来本身就是可刷的 AK3 zip
 
       - name: Fetch matching ReSukiSU manager APKs
         env:
@@ -132,11 +132,15 @@ jobs:
               gh api "repos/$RSU_REPO/actions/artifacts/$art/zip" > "$name.zip"
               unzip -oq "$name.zip" -d manager-apk
             done
-            # 只保留 arm64-v8a 变体（剔除 universal / armeabi-v7a / x86_64）
+            # 只保留 arm64-v8a 变体并按变种分目录（剔除 universal / armeabi-v7a / x86_64）
             find manager-apk -type f -name '*.apk' ! -name '*arm64-v8a*' -delete
+            rm -rf manager manager-spoofed
+            mkdir -p manager manager-spoofed
+            find manager-apk -type f -name '*arm64-v8a-release.apk' ! -name '*spoofed*' -exec mv {} manager/ \;
+            find manager-apk -type f -name '*arm64-v8a-release.apk' -name '*spoofed*' -exec mv {} manager-spoofed/ \;
             local n
-            n=$(find manager-apk -type f -name '*.apk' | wc -l)
-            [ "$n" -ge 2 ] || { echo "::error::expected >=2 arm64-v8a manager APKs, got $n"; return 1; }
+            n=$(find manager manager-spoofed -type f -name '*.apk' | wc -l)
+            [ "$n" -ge 2 ] || { echo "::error::expected 2 arm64-v8a manager APKs (release + spoofed), got $n"; return 1; }
           }
 
           RUN_ID=""
@@ -156,20 +160,29 @@ jobs:
           fi
           [ -n "$RUN_ID" ] || { echo "::error::no usable ReSukiSU Build Manager artifacts found"; exit 1; }
           echo "RSU_RUN_URL=https://github.com/$RSU_REPO/actions/runs/$RUN_ID" >> "$GITHUB_ENV"
-          ls -la manager-apk
+          ls -la manager manager-spoofed
 
       - name: Upload AnyKernel3 flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name: rodin-${{ env.KERNEL_RELEASE }}-AnyKernel3
-          path: Rodin-*-AnyKernel3.zip
+          # artifact 根目录即 AK3 包内容（anykernel.sh / Image / META-INF/...），
+          # 下载得到的 zip 无需再解包即可刷入
+          name: Rodin-${{ env.KERNEL_RELEASE }}-AnyKernel3
+          path: AnyKernel3/**
           if-no-files-found: error
 
-      - name: Upload ReSukiSU manager APKs (arm64-v8a)
+      - name: Upload ReSukiSU manager APK (release, arm64-v8a)
         uses: actions/upload-artifact@v4
         with:
-          name: rodin-${{ env.KERNEL_RELEASE }}-manager-arm64-v8a
-          path: manager-apk/*.apk
+          name: rodin-${{ env.KERNEL_RELEASE }}-manager
+          path: manager/*.apk
+          if-no-files-found: error
+
+      - name: Upload ReSukiSU manager APK (spoofed, arm64-v8a)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rodin-${{ env.KERNEL_RELEASE }}-manager-spoofed
+          path: manager-spoofed/*.apk
           if-no-files-found: error
 
       - name: Build summary
@@ -177,6 +190,6 @@ jobs:
           {
             echo "### Rodin kernel build"
             echo "- kernel: \`${KERNEL_RELEASE}\` (Image.lz4 = lz4 legacy, magic 02214c18 verified)"
-            echo "- AK3 flashable zip: \`Rodin-${KERNEL_RELEASE}-AnyKernel3.zip\` (kernel blob Image = lz4 legacy)"
-            echo "- ReSukiSU manager (arm64-v8a only): \`Manager-release\` + \`Spoofed-Manager-release\` from [CI run]($RSU_RUN_URL)"
+            echo "- AK3 flashable zip: artifact \`Rodin-${KERNEL_RELEASE}-AnyKernel3\` (downloaded zip is directly flashable, kernel blob Image = lz4 legacy)"
+            echo "- ReSukiSU manager (arm64-v8a only): artifacts \`rodin-${KERNEL_RELEASE}-manager\` / \`rodin-${KERNEL_RELEASE}-manager-spoofed\` from [CI run]($RSU_RUN_URL)"
           } >> "$GITHUB_STEP_SUMMARY"
