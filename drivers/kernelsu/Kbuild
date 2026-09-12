@@ -79,16 +79,24 @@ KSU_COMMIT_SHA  := $(KSU_COMMIT_SHA)-dirty
 endif
 KSU_BRANCH_NAME := $(shell cd $(KSU_SRC); $(GIT_BIN) branch --show-current 2>/dev/null || echo "unknown")
 else
-# Vendored as an in-tree copy of ReSukiSU main @ fa1da13f. Do NOT query git
-# here: this directory lives inside the kernel git repository, so rev-list,
-# rev-parse and diff-index would silently report the kernel tree history and
-# leak its commit count, sha and dirty state into the ReSukiSU version info.
-KSU_LOCAL_VERSION := 4436
+# Vendored as an in-tree copy of ReSukiSU main @ 3380d41f (tag v4.2.0-rc1). Do NOT
+# query git here: this directory lives inside the kernel git repository, so
+# rev-list, rev-parse and diff-index would silently report the kernel tree
+# history and leak its commit count, sha and dirty state into the ReSukiSU
+# version info.
+KSU_LOCAL_VERSION := 4437
 KSU_TAG_NAME    := v4.2.0-rc1
-KSU_COMMIT_SHA  := fa1da13f
+KSU_COMMIT_SHA  := 3380d41f
 KSU_BRANCH_NAME := main
 endif
 KSU_VERSION := $(shell expr 30000 + $(KSU_LOCAL_VERSION) + 700)
+
+KSU_TAG_NAME    := $(shell cd $(KSU_SRC); $(GIT_BIN) describe --abbrev=0 --tags 2>/dev/null || echo "v4.1.0")
+KSU_COMMIT_SHA  := $(shell cd $(KSU_SRC); $(GIT_BIN) rev-parse --short=8 HEAD 2>/dev/null || echo "unknown")
+ifneq ($(shell cd $(KSU_SRC); $(GIT_BIN) diff-index --quiet HEAD; echo $$?),0)
+KSU_COMMIT_SHA  := $(KSU_COMMIT_SHA)-dirty
+endif
+KSU_BRANCH_NAME := $(shell cd $(KSU_SRC); $(GIT_BIN) branch --show-current 2>/dev/null || echo "unknown")
 
 # call subst to process placeholders
 KSU_VERSION_FULL := $(subst ",,$(CONFIG_KSU_FULL_NAME_FORMAT))
