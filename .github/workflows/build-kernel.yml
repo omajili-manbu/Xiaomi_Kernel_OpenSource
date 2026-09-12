@@ -17,7 +17,9 @@ permissions:
 env:
   KERNEL_BRANCH: bsp-rodin-v-oss-bp
   CLANG_VER: clang-r596125
-  CLANG_BRANCH: mirror-goog-llvm-r596125-release
+  # clang-r596125 预编译目录所在的 googlesource 分支（注意不是
+  # mirror-goog-llvm-r596125-release，那是 LLVM 源码镜像，没有预编译产物）
+  CLANG_BRANCH: mirror-goog-main-llvm-toolchain-source
   RSU_REPO: ReSukiSU/ReSukiSU
 
 jobs:
@@ -41,26 +43,45 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flex bison bc libelf-dev libssl-dev dwarves lz4
+          sudo apt-get install -y --no-install-recommends flex bison bc libelf-dev libssl-dev dwarves lz4 zip unzip
 
       - name: Download clang-r596125
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/clang"
-          if curl -fL --retry 3 \
-              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${CLANG_BRANCH}/${CLANG_VER}.tar.gz" \
-              -o "$RUNNER_TEMP/clang.tgz"; then
-            tar -xzf "$RUNNER_TEMP/clang.tgz" -C "$RUNNER_TEMP/clang"
-          else
-            echo "::warning::clang tarball download failed, falling back to sparse git clone"
+          CLANG_DIR="$RUNNER_TEMP/clang"
+          mkdir -p "$CLANG_DIR"
+          # 1) 分支直链（+archive） 2) 固定 commit 直链 3) 稀疏克隆兜底
+          URLS=(
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${CLANG_BRANCH}/${CLANG_VER}.tar.gz"
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/8b6826407e25a197d7cf7ceacab0bf67c11173de/${CLANG_VER}.tar.gz"
+          )
+          ok=""
+          for url in "${URLS[@]}"; do
+            echo "trying $url"
+            rm -rf "$CLANG_DIR"; mkdir -p "$CLANG_DIR"
+            if curl -fL --retry 3 --connect-timeout 30 --max-time 1200 "$url" -o "$RUNNER_TEMP/clang.tgz" \
+               && tar -xzf "$RUNNER_TEMP/clang.tgz" -C "$CLANG_DIR"; then
+              if [ -x "$CLANG_DIR/bin/clang" ]; then
+                ok=yes
+              elif [ -x "$CLANG_DIR/$CLANG_VER/bin/clang" ]; then
+                mv "$CLANG_DIR/$CLANG_VER"/* "$CLANG_DIR"/ && ok=yes
+              fi
+              [ -n "$ok" ] && break
+            fi
+            echo "::warning::download/extract failed: $url"
+          done
+          if [ -z "$ok" ]; then
+            echo "::warning::archive endpoints failed, falling back to sparse git clone"
+            rm -rf "$CLANG_DIR"; mkdir -p "$CLANG_DIR"
             git clone --depth=1 --filter=blob:none --sparse -b "$CLANG_BRANCH" \
               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
               "$RUNNER_TEMP/clang-src"
             git -C "$RUNNER_TEMP/clang-src" sparse-checkout set "$CLANG_VER"
-            mv "$RUNNER_TEMP/clang-src/$CLANG_VER" "$RUNNER_TEMP/clang"
+            mv "$RUNNER_TEMP/clang-src/$CLANG_VER"/* "$CLANG_DIR"/
           fi
-          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/clang/bin/clang" --version
+          test -x "$CLANG_DIR/bin/clang" || { echo "::error::clang binary not found after download"; ls -la "$CLANG_DIR"; exit 1; }
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          "$CLANG_DIR/bin/clang" --version
 
       - name: Build kernel (gki_defconfig -> Image + Image.lz4)
         run: |
@@ -70,9 +91,14 @@ jobs:
           JOBS="$(nproc)"
           echo "building with ${JOBS} jobs"
           make ARCH=arm64 LLVM=1 -j"$JOBS" Image Image.lz4
-          # 校验 LZ4 legacy 魔数 0x184C2102（BUILD-GUIDE.md 要求）
-          MAGIC=$(xxd -p -l4 arch/arm64/boot/Image.lz4)
-          [ "$MAGIC" = "02214c18" ] || { echo "::error::Image.lz4 is not lz4 legacy (magic: $MAGIC)"; exit 1; }
+          # 校验 LZ4 legacy 魔数 0x184C2102（BUILD-GUIDE.md 要求）；不是 legacy 就用 lz4 -l 重压
+          MAGIC=$(od -An -tx1 -N4 arch/arm64/boot/Image.lz4 | tr -d ' \n')
+          if [ "$MAGIC" != "02214c18" ]; then
+            echo "::warning::Image.lz4 magic $MAGIC is not lz4 legacy - recompressing with 'lz4 -l'"
+            lz4 -f -l -9 arch/arm64/boot/Image arch/arm64/boot/Image.lz4
+            MAGIC=$(od -An -tx1 -N4 arch/arm64/boot/Image.lz4 | tr -d ' \n')
+            [ "$MAGIC" = "02214c18" ] || { echo "::error::Image.lz4 still not lz4 legacy (magic: $MAGIC)"; exit 1; }
+          fi
           KERNEL_RELEASE=$(cat include/config/kernel.release)
           echo "KERNEL_RELEASE=$KERNEL_RELEASE" >> "$GITHUB_ENV"
 
