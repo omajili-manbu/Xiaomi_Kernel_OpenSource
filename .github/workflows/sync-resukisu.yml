@@ -103,15 +103,35 @@ jobs:
           mkdir -p drivers/kernelsu/uapi
           cp "$RSU"/uapi/*.h drivers/kernelsu/uapi/
 
-          # 3) SUSFS kernel-side files from the susfs4ksu fork (-mod carries the
-          #    owner's 55/56 patches plus the upstream files).
+          # 3) SUSFS kernel-side files: the tree carries a matched SUSFS v2.3.0
+          #    set (fs/susfs.c + include/linux/susfs{,_def}.h) backing the
+          #    already-applied kernel-side hooks (fs/statfs.c, fs/proc/fd.c, ...).
+          #    The susfs4ksu -mod fork's fs/susfs.c does NOT implement
+          #    susfs_open_redirect_spoof_vfs_statfs/seq_show; overwriting with it
+          #    broke the build (run 34705303941, undefined symbols at link).
+          #    So the -mod files are only a bootstrap for a tree without SUSFS;
+          #    never overwrite SUSFS files that are already present.
           git clone --depth 1 -b "$SUSFS_BRANCH" "$SUSFS_REPO_URL" "$RUNNER_TEMP/susfs"
           SUSFS_SHA=$(git -C "$RUNNER_TEMP/susfs" rev-parse --short=8 HEAD)
           echo "susfs_sha=$SUSFS_SHA" >> "$GITHUB_OUTPUT"
           KP="$RUNNER_TEMP/susfs/kernel_patches"
-          cp -f "$KP/include/linux/susfs.h"     include/linux/susfs.h
-          cp -f "$KP/fs/susfs.c"                fs/susfs.c
-          cp -f "$KP/include/linux/susfs_def.h" include/linux/susfs_def.h
+          if [ ! -f fs/susfs.c ] || [ ! -f include/linux/susfs.h ] || [ ! -f include/linux/susfs_def.h ]; then
+            echo "SUSFS files missing -> bootstrap from $SUSFS_REPO_URL@$SUSFS_BRANCH"
+            cp -f "$KP/include/linux/susfs.h"     include/linux/susfs.h
+            cp -f "$KP/fs/susfs.c"                fs/susfs.c
+            cp -f "$KP/include/linux/susfs_def.h" include/linux/susfs_def.h
+          else
+            echo "SUSFS kernel-side files present -> left untouched"
+          fi
+
+          # 3b) Consistency gate: kernel-side call sites already in the tree must
+          #     be backed by fs/susfs.c. Abort (push nothing) on mismatch.
+          for sym in susfs_open_redirect_spoof_vfs_statfs susfs_open_redirect_spoof_seq_show; do
+            grep -q "$sym" fs/susfs.c || {
+              echo "::error::fs/susfs.c does not define $sym - SUSFS kernel-side/version mismatch, aborting"
+              exit 1
+            }
+          done
 
           # 4) Kernel-side SUSFS patches: apply if missing (atomic), tolerate
           #    already-applied (the documented steady state).
@@ -172,7 +192,7 @@ jobs:
             echo "drivers/kernelsu: sync ReSukiSU to ${{ steps.rsu_sync.outputs.rsu_sha }} and pin version ${{ steps.rsu_sync.outputs.rsu_count }}"
             echo ""
             echo "Re-land ReSukiSU kernel module from $RSU_BRANCH (${{ steps.rsu_sync.outputs.rsu_sha }}, tag ${{ steps.rsu_sync.outputs.rsu_tag }})."
-            echo "SUSFS files synced from susfs4ksu $SUSFS_BRANCH (${{ steps.landing.outputs.susfs_sha }})."
+            echo "SUSFS kernel-side files preserved in-tree; patch source susfs4ksu $SUSFS_BRANCH (${{ steps.landing.outputs.susfs_sha }})."
             [ "${{ steps.landing.outputs.patch_applied }}" = "1" ] && echo "Kernel-side SUSFS patch(es) were missing and have been re-applied." || true
             echo ""
             echo "Version pinned via vendored Kbuild (no git query):"
