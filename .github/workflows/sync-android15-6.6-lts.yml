@@ -1,0 +1,124 @@
+name: sync-android15-6.6-lts
+
+# Merge AOSP android15-6.6-lts into bsp-rodin-v-oss-bp.
+# Rules (per owner):
+#   - clean merge   -> push the merge commit directly to the branch
+#   - any conflict  -> abort the merge, push nothing, open/update a tracking issue
+# NOTE: this workflow does NOT build-test the merged tree; verify a build
+# locally before shipping a boot image.
+
+on:
+  schedule:
+    - cron: '30 18 * * *'   # daily 02:30 UTC+8
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+# Serialize with sync-resukisu (both push to the same branch).
+concurrency:
+  group: kernel-bsp-rodin-v-oss-bp
+  cancel-in-progress: false
+
+env:
+  KERNEL_BRANCH: bsp-rodin-v-oss-bp
+  AOSP_REPO: https://android.googlesource.com/kernel/common
+  LTS_BRANCH: android15-6.6-lts
+  ISSUE_TITLE: "[auto-sync] android15-6.6-lts merge conflict - manual resolution needed"
+
+jobs:
+  merge-lts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kernel branch (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: bsp-rodin-v-oss-bp
+          fetch-depth: 0
+
+      - name: Git identity
+        run: |
+          git config user.name  "omajili-manbu"
+          git config user.email "qwer12777332899@gmail.com"
+
+      - name: Fetch LTS branch from AOSP
+        run: |
+          git remote add aosp "$AOSP_REPO"
+          git fetch --no-tags aosp "$LTS_BRANCH:refs/remotes/aosp/$LTS_BRANCH"
+
+      - name: Compute LTS delta
+        id: delta
+        run: |
+          LTS="refs/remotes/aosp/$LTS_BRANCH"
+          if ! git merge-base HEAD "$LTS" >/dev/null 2>&1; then
+            echo "::error::HEAD and $LTS have no merge base (unrelated histories) - refusing to merge"
+            exit 1
+          fi
+          COUNT=$(git rev-list HEAD.."$LTS" --count)
+          OURS=$(git rev-list "$LTS"..HEAD --count)
+          echo "new_commits=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git rev-parse --short=12 "$LTS")" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "### android15-6.6-lts sync"
+            echo "- upstream tip: `git rev-parse "$LTS"`"
+            echo "- new upstream commits: $COUNT"
+            echo "- local-only commits kept as ours: $OURS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Merge LTS (abort on any conflict)
+        id: merge
+        if: steps.delta.outputs.up_to_date != 'true'
+        run: |
+          set -euo pipefail
+          LTS="refs/remotes/aosp/$LTS_BRANCH"
+          git merge --no-ff --no-commit "$LTS" > /tmp/merge.log 2>&1 || true
+          CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+          if [ -n "$CONFLICTS" ]; then
+            printf '%s\n' "$CONFLICTS" > /tmp/conflict-files.txt
+            git merge --abort
+            echo "has_conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::error::$(printf '%s\n' "$CONFLICTS" | wc -l) conflicting files - merge aborted, nothing pushed"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "::error::git merge failed without producing conflicts:"
+            cat /tmp/merge.log
+            exit 1
+          fi
+          UP_SHA=$(git rev-parse --short=12 "$LTS")
+          git commit -m "Merge $LTS_BRANCH ($UP_SHA) into $KERNEL_BRANCH"
+          git push origin "HEAD:$KERNEL_BRANCH"
+          {
+            echo "### Result"
+            echo "- merged $LTS_BRANCH @ \`$UP_SHA\` and pushed to \`$KERNEL_BRANCH\`"
+            echo "- build verification was NOT run - build locally before shipping"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: File tracking issue on conflict
+        if: failure() && steps.merge.outputs.has_conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Automatic merge of \`$LTS_BRANCH\` (\`${{ steps.delta.outputs.upstream_sha }}\`) into \`$KERNEL_BRANCH\` hit conflicts."
+            echo "The merge was **aborted** and nothing was pushed. Resolve the conflicts manually"
+            echo "(follow the MERGE-GUIDE.md methodology), then re-run this workflow."
+            echo ""
+            echo "### Conflicting files"
+            echo '```'
+            head -200 /tmp/conflict-files.txt
+            echo '```'
+            echo "Total: $(wc -l < /tmp/conflict-files.txt) files."
+            echo ""
+            echo "[Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          } > /tmp/issue-body.md
+          EXISTING=$(gh issue list --state open --search "auto-sync android15-6.6-lts conflict in:title" --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #$EXISTING already tracks this conflict - not duplicating."
+            exit 0
+          fi
+          gh issue create --title "$ISSUE_TITLE" --body-file /tmp/issue-body.md

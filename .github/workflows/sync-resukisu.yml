@@ -1,0 +1,219 @@
+name: sync-resukisu
+
+# Sync omajili-manbu/ReSukiSU (fork) with ReSukiSU/ReSukiSU (upstream), then
+# re-land the kernel module into drivers/kernelsu and refresh the SUSFS files.
+# Rules (per owner):
+#   - any conflict or structural surprise -> abort, push nothing, open/update an issue
+#   - version pinning per BUILD-GUIDE.md: KSU_VERSION = 30000 + rev-list-count + 700
+# NOTE: this workflow does NOT build-test the landed tree; build locally before
+# shipping a boot image.
+
+on:
+  schedule:
+    - cron: '50 18 * * *'   # daily 02:50 UTC+8, after sync-android15-6.6-lts
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+# Serialize with sync-android15-6.6-lts (both push to the same branch).
+concurrency:
+  group: kernel-bsp-rodin-v-oss-bp
+  cancel-in-progress: false
+
+env:
+  KERNEL_BRANCH: bsp-rodin-v-oss-bp
+  RSU_FORK_URL: https://github.com/omajili-manbu/ReSukiSU.git
+  RSU_UPSTREAM_URL: https://github.com/ReSukiSU/ReSukiSU.git
+  RSU_BRANCH: main
+  SUSFS_REPO_URL: https://github.com/omajili-manbu/susfs4ksu.git
+  SUSFS_BRANCH: gki-android15-6.6-mod
+  ISSUE_TITLE: "[auto-sync] ReSukiSU sync failed - manual attention needed"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kernel branch
+        uses: actions/checkout@v4
+        with:
+          ref: bsp-rodin-v-oss-bp
+          fetch-depth: 1
+
+      - name: Git identity
+        run: |
+          git config user.name  "omajili-manbu"
+          git config user.email "qwer12777332899@gmail.com"
+
+      - name: Check GH_PAT secret
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::repository secret GH_PAT is not set - cannot sync the ReSukiSU fork"
+            exit 1
+          fi
+
+      - name: Sync ReSukiSU fork with upstream
+        id: rsu_sync
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          git clone -b "$RSU_BRANCH" "$RSU_FORK_URL" "$RUNNER_TEMP/rsu"
+          cd "$RUNNER_TEMP/rsu"
+          git remote add upstream "$RSU_UPSTREAM_URL"
+          git fetch upstream "$RSU_BRANCH" --tags
+          UP=$(git rev-parse FETCH_HEAD)
+          if ! git merge --ff-only "$UP" >/tmp/rsu-merge.log 2>&1; then
+            echo "fork $RSU_BRANCH is not a fast-forward of upstream - trying a real merge"
+            if ! git merge --no-edit "$UP" >>/tmp/rsu-merge.log 2>&1; then
+              git merge --abort || true
+              cp /tmp/rsu-merge.log "$RUNNER_TEMP/rsu-conflict.log" || true
+              echo "has_conflict=true" >> "$GITHUB_OUTPUT"
+              echo "::error::ReSukiSU fork sync merge conflict - aborted, nothing pushed"
+              exit 1
+            fi
+          fi
+          git push "https://x-access-token:${GH_PAT}@github.com/omajili-manbu/ReSukiSU.git" "$RSU_BRANCH"
+          echo "rsu_sha=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "rsu_count=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          echo "rsu_tag=$(git describe --abbrev=0 --tags 2>/dev/null || echo v4.1.0)" >> "$GITHUB_OUTPUT"
+          echo "rsu_branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ReSukiSU fork sync"
+            echo "- fork $RSU_BRANCH now at: \`$(git rev-parse HEAD)\`"
+            echo "- version inputs: count $(git rev-list --count HEAD), tag $(git describe --abbrev=0 --tags 2>/dev/null || echo v4.1.0)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Land ReSukiSU module + refresh SUSFS files
+        id: landing
+        run: |
+          set -euo pipefail
+          RSU="$RUNNER_TEMP/rsu"
+
+          # 1) Mirror ReSukiSU kernel/ into drivers/kernelsu (deletes stale files,
+          #    exactly like the manual rsync landing in BUILD-GUIDE.md).
+          rsync -a --delete "$RSU/kernel/" drivers/kernelsu/
+
+          # 2) Rebuild the real uapi/ directory: the repo's kernel/include/uapi
+          #    symlink does not resolve once copied into the kernel tree.
+          rm -rf drivers/kernelsu/uapi
+          mkdir -p drivers/kernelsu/uapi
+          cp "$RSU"/uapi/*.h drivers/kernelsu/uapi/
+
+          # 3) SUSFS kernel-side files from the susfs4ksu fork (-mod carries the
+          #    owner's 55/56 patches plus the upstream files).
+          git clone --depth 1 -b "$SUSFS_BRANCH" "$SUSFS_REPO_URL" "$RUNNER_TEMP/susfs"
+          SUSFS_SHA=$(git -C "$RUNNER_TEMP/susfs" rev-parse --short=8 HEAD)
+          echo "susfs_sha=$SUSFS_SHA" >> "$GITHUB_OUTPUT"
+          KP="$RUNNER_TEMP/susfs/kernel_patches"
+          cp -f "$KP/include/linux/susfs.h"     include/linux/susfs.h
+          cp -f "$KP/fs/susfs.c"                fs/susfs.c
+          cp -f "$KP/include/linux/susfs_def.h" include/linux/susfs_def.h
+
+          # 4) Kernel-side SUSFS patches: apply if missing (atomic), tolerate
+          #    already-applied (the documented steady state).
+          APPLIED=0
+          for p in 50_add_susfs_in_gki-android15-6.6.patch \
+                   55_selinux_hook_hide_susfs_artifacts.patch \
+                   56_selinuxfs_hide_sensitive_av.patch; do
+            if git apply --check "$KP/$p" 2>/tmp/patch-err; then
+              echo "$p: not applied yet -> applying"
+              git apply "$KP/$p" || { echo "::error::$p failed to apply"; exit 1; }
+              APPLIED=1
+            else
+              echo "$p: already applied (check: $(head -c 200 /tmp/patch-err | tr '\n' ' '))"
+            fi
+          done
+          echo "patch_applied=$APPLIED" >> "$GITHUB_OUTPUT"
+
+      - name: Pin ReSukiSU version in drivers/kernelsu/Kbuild
+        run: |
+          python3 .github/scripts/ksu_pin_version.py \
+            --kbuild drivers/kernelsu/Kbuild \
+            --count  "${{ steps.rsu_sync.outputs.rsu_count }}" \
+            --tag    "${{ steps.rsu_sync.outputs.rsu_tag }}" \
+            --sha8   "${{ steps.rsu_sync.outputs.rsu_sha }}" \
+            --branch "${{ steps.rsu_sync.outputs.rsu_branch }}"
+
+      - name: Sanity checks (BUILD-GUIDE checklist)
+        run: |
+          set -euo pipefail
+          UAPI_H=$(ls drivers/kernelsu/uapi/*.h | wc -l)
+          [ "$UAPI_H" -ge 6 ] || { echo "::error::uapi/ has $UAPI_H headers, expected >= 6"; exit 1; }
+          grep -q "KERNEL_SU_VERSION" drivers/kernelsu/include/ksu.h
+          grep -q 'KSU_VERSION := $(shell expr 30000' drivers/kernelsu/Kbuild
+          grep -q "KSU_COMMIT_SHA  := ${{ steps.rsu_sync.outputs.rsu_sha }}" drivers/kernelsu/Kbuild
+          for d in arm64 arm32 x86_64; do
+            [ -d "drivers/kernelsu/hook/$d" ] || { echo "::error::missing drivers/kernelsu/hook/$d"; exit 1; }
+          done
+          test -f fs/susfs.c && test -f include/linux/susfs.h && test -f include/linux/susfs_def.h
+          echo "all sanity checks passed"
+
+      - name: Commit and push
+        id: commit
+        run: |
+          set -euo pipefail
+          git add -A
+          TRACKED_UAPI=$(git ls-files drivers/kernelsu/uapi | wc -l)
+          [ "$TRACKED_UAPI" -ge 6 ] || { echo "::error::uapi headers not tracked (got $TRACKED_UAPI) - .gitignore may be swallowing them"; exit 1; }
+          if git diff --cached --quiet; then
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            echo "ReSukiSU + SUSFS already up to date - nothing to commit"
+            {
+              echo "### Result"
+              echo "- ReSukiSU \`${{ steps.rsu_sync.outputs.rsu_sha }}\` and SUSFS \`${{ steps.landing.outputs.susfs_sha }}\` were already landed - no commit needed"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "drivers/kernelsu: sync ReSukiSU to ${{ steps.rsu_sync.outputs.rsu_sha }} and pin version ${{ steps.rsu_sync.outputs.rsu_count }}"
+            echo ""
+            echo "Re-land ReSukiSU kernel module from $RSU_BRANCH (${{ steps.rsu_sync.outputs.rsu_sha }}, tag ${{ steps.rsu_sync.outputs.rsu_tag }})."
+            echo "SUSFS files synced from susfs4ksu $SUSFS_BRANCH (${{ steps.landing.outputs.susfs_sha }})."
+            [ "${{ steps.landing.outputs.patch_applied }}" = "1" ] && echo "Kernel-side SUSFS patch(es) were missing and have been re-applied." || true
+            echo ""
+            echo "Version pinned via vendored Kbuild (no git query):"
+            echo "  KSU_LOCAL_VERSION = ${{ steps.rsu_sync.outputs.rsu_count }}"
+            echo "  KSU_TAG_NAME      = ${{ steps.rsu_sync.outputs.rsu_tag }}"
+            echo "  KSU_COMMIT_SHA    = ${{ steps.rsu_sync.outputs.rsu_sha }}"
+            echo "  KSU_BRANCH_NAME   = ${{ steps.rsu_sync.outputs.rsu_branch }}"
+          } > /tmp/commit-msg.txt
+          git commit -F /tmp/commit-msg.txt
+          git push origin "HEAD:$KERNEL_BRANCH"
+          {
+            echo "### Result"
+            echo "- ReSukiSU landed: \`${{ steps.rsu_sync.outputs.rsu_sha }}\` (version ${{ steps.rsu_sync.outputs.rsu_count }}, tag ${{ steps.rsu_sync.outputs.rsu_tag }})"
+            echo "- SUSFS files from susfs4ksu@$SUSFS_BRANCH: \`${{ steps.landing.outputs.susfs_sha }}\`"
+            echo "- pushed to \`$KERNEL_BRANCH\`"
+            echo "- build verification was NOT run - build locally before shipping"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: File tracking issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXTRA=""
+          if [ -f "$RUNNER_TEMP/rsu-conflict.log" ]; then
+            EXTRA=$'### ReSukiSU fork sync merge log\n```\n'
+            EXTRA+="$(head -100 "$RUNNER_TEMP/rsu-conflict.log")"
+            EXTRA+=$'\n```\n'
+          fi
+          {
+            echo "The [sync-resukisu run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) failed."
+            echo "**Nothing was pushed.** Common causes:"
+            echo "- merge conflict while syncing the ReSukiSU fork with upstream (see log below)"
+            echo "- upstream ReSukiSU Kbuild structure changed (ksu_pin_version.py aborts by design)"
+            echo "- \`GH_PAT\` secret missing or expired"
+            echo ""
+            echo "$EXTRA"
+          } > /tmp/issue-body.md
+          EXISTING=$(gh issue list --state open --search "auto-sync ReSukiSU failed in:title" --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #$EXISTING already open - not duplicating."
+            exit 0
+          fi
+          gh issue create --title "$ISSUE_TITLE" --body-file /tmp/issue-body.md
