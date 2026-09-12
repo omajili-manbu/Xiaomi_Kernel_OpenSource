@@ -2,7 +2,8 @@ name: build-kernel
 
 # 手动触发的 rodin 内核构建（参考 ABK build.yml 的核心编译流程裁剪）：
 #   clang-r596125 -> gki_defconfig -> Image + Image.lz4 (LZ4 legacy)
-#   -> AnyKernel3 可刷包（内置 Image.lz4）
+#   -> AnyKernel3 可刷包（内核 blob 命名为 Image，内容为 lz4 legacy 格式，
+#      设备启动时只认名为 Image 的 blob）
 #   + 与内核树 drivers/kernelsu 落地版本一致的 ReSukiSU 管理器
 #     （取 ReSukiSU/ReSukiSU main 分支 Build Manager CI 产物：release + spoofed）
 
@@ -66,7 +67,9 @@ jobs:
           set -euo pipefail
           # BUILD-GUIDE.md：只能用 gki_defconfig 生成用于编译的 .config
           make ARCH=arm64 LLVM=1 gki_defconfig
-          make ARCH=arm64 LLVM=1 -j"$(nproc --all)" Image Image.lz4
+          JOBS="$(nproc)"
+          echo "building with ${JOBS} jobs"
+          make ARCH=arm64 LLVM=1 -j"$JOBS" Image Image.lz4
           # 校验 LZ4 legacy 魔数 0x184C2102（BUILD-GUIDE.md 要求）
           MAGIC=$(xxd -p -l4 arch/arm64/boot/Image.lz4)
           [ "$MAGIC" = "02214c18" ] || { echo "::error::Image.lz4 is not lz4 legacy (magic: $MAGIC)"; exit 1; }
@@ -78,7 +81,8 @@ jobs:
           set -euo pipefail
           git clone --depth=1 -b gki-2.0 https://github.com/WildKernels/AnyKernel3.git
           rm -rf AnyKernel3/.git
-          cp arch/arm64/boot/Image.lz4 AnyKernel3/Image.lz4
+          # 设备启动只认名为 Image 的 blob；内容为 lz4 legacy 压缩的内核
+          cp arch/arm64/boot/Image.lz4 AnyKernel3/Image
           sed -i "s|^kernel.string=.*|kernel.string=Rodin ${KERNEL_RELEASE} (ReSukiSU)|" AnyKernel3/anykernel.sh
           ( cd AnyKernel3 && zip -r9 "../Rodin-${KERNEL_RELEASE}-AnyKernel3.zip" . )
 
@@ -137,6 +141,6 @@ jobs:
           {
             echo "### Rodin kernel build"
             echo "- kernel: \`${KERNEL_RELEASE}\` (Image.lz4 = lz4 legacy, magic 02214c18 verified)"
-            echo "- AK3 flashable zip: \`Rodin-${KERNEL_RELEASE}-AnyKernel3.zip\`"
+            echo "- AK3 flashable zip: \`Rodin-${KERNEL_RELEASE}-AnyKernel3.zip\` (kernel blob Image = lz4 legacy)"
             echo "- ReSukiSU manager: \`Manager-release\` + \`Spoofed-Manager-release\` from [CI run]($RSU_RUN_URL)"
           } >> "$GITHUB_STEP_SUMMARY"
