@@ -132,6 +132,11 @@ jobs:
               gh api "repos/$RSU_REPO/actions/artifacts/$art/zip" > "$name.zip"
               unzip -oq "$name.zip" -d manager-apk
             done
+            # 只保留 arm64-v8a 变体（剔除 universal / armeabi-v7a / x86_64）
+            find manager-apk -type f -name '*.apk' ! -name '*arm64-v8a*' -delete
+            local n
+            n=$(find manager-apk -type f -name '*.apk' | wc -l)
+            [ "$n" -ge 2 ] || { echo "::error::expected >=2 arm64-v8a manager APKs, got $n"; return 1; }
           }
 
           RUN_ID=""
@@ -153,13 +158,18 @@ jobs:
           echo "RSU_RUN_URL=https://github.com/$RSU_REPO/actions/runs/$RUN_ID" >> "$GITHUB_ENV"
           ls -la manager-apk
 
-      - name: Upload build artifacts
+      - name: Upload AnyKernel3 flashable zip
         uses: actions/upload-artifact@v4
         with:
-          name: rodin-${{ env.KERNEL_RELEASE }}
-          path: |
-            Rodin-*-AnyKernel3.zip
-            manager-apk/*.apk
+          name: rodin-${{ env.KERNEL_RELEASE }}-AnyKernel3
+          path: Rodin-*-AnyKernel3.zip
+          if-no-files-found: error
+
+      - name: Upload ReSukiSU manager APKs (arm64-v8a)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rodin-${{ env.KERNEL_RELEASE }}-manager-arm64-v8a
+          path: manager-apk/*.apk
           if-no-files-found: error
 
       - name: Build summary
@@ -168,5 +178,5 @@ jobs:
             echo "### Rodin kernel build"
             echo "- kernel: \`${KERNEL_RELEASE}\` (Image.lz4 = lz4 legacy, magic 02214c18 verified)"
             echo "- AK3 flashable zip: \`Rodin-${KERNEL_RELEASE}-AnyKernel3.zip\` (kernel blob Image = lz4 legacy)"
-            echo "- ReSukiSU manager: \`Manager-release\` + \`Spoofed-Manager-release\` from [CI run]($RSU_RUN_URL)"
+            echo "- ReSukiSU manager (arm64-v8a only): \`Manager-release\` + \`Spoofed-Manager-release\` from [CI run]($RSU_RUN_URL)"
           } >> "$GITHUB_STEP_SUMMARY"

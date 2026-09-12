@@ -120,6 +120,7 @@ jobs:
             cp -f "$KP/include/linux/susfs.h"     include/linux/susfs.h
             cp -f "$KP/fs/susfs.c"                fs/susfs.c
             cp -f "$KP/include/linux/susfs_def.h" include/linux/susfs_def.h
+            BOOTSTRAPPED=1
           else
             echo "SUSFS kernel-side files present -> left untouched"
           fi
@@ -133,18 +134,30 @@ jobs:
             }
           done
 
-          # 4) Kernel-side SUSFS patches: apply if missing (atomic), tolerate
-          #    already-applied (the documented steady state).
+          # 4) Kernel-side SUSFS patches. Steady state manages only the owner's
+          #    55/56 custom patches, with a strict tri-state check:
+          #    forward-appliable -> apply; reverse-appliable -> already applied;
+          #    neither -> tree/patch drift, abort (owner rule: any conflict or
+          #    structural surprise -> abort, push nothing, open an issue).
+          #    The upstream-style 50 patch belongs to the bootstrap path only:
+          #    on the v2.3.0 tree it can neither apply nor reverse, and silently
+          #    treating that as "already applied" would hide real drift.
           APPLIED=0
-          for p in 50_add_susfs_in_gki-android15-6.6.patch \
-                   55_selinux_hook_hide_susfs_artifacts.patch \
-                   56_selinuxfs_hide_sensitive_av.patch; do
+          PATCHES=(55_selinux_hook_hide_susfs_artifacts.patch \
+                   56_selinuxfs_hide_sensitive_av.patch)
+          if [ "${BOOTSTRAPPED:-0}" = "1" ]; then
+            PATCHES=(50_add_susfs_in_gki-android15-6.6.patch "${PATCHES[@]}")
+          fi
+          for p in "${PATCHES[@]}"; do
             if git apply --check "$KP/$p" 2>/tmp/patch-err; then
               echo "$p: not applied yet -> applying"
               git apply "$KP/$p" || { echo "::error::$p failed to apply"; exit 1; }
               APPLIED=1
+            elif git apply --reverse --check "$KP/$p" 2>/dev/null; then
+              echo "$p: already applied -> skipping"
             else
-              echo "$p: already applied (check: $(head -c 200 /tmp/patch-err | tr '\n' ' '))"
+              echo "::error::$p can neither be applied nor reversed - tree/patch mismatch, aborting"
+              exit 1
             fi
           done
           echo "patch_applied=$APPLIED" >> "$GITHUB_OUTPUT"
