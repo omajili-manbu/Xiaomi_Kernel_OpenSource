@@ -134,14 +134,31 @@ jobs:
             }
           done
 
+          # Net-effect markers per owner patch: distinctive strings that only
+          # exist in the tree once the patch's changes are in. The tree evolves
+          # directly (run 34718663544: 56's reverse-apply failed although its
+          # changes were present), so markers - not byte-matching - decide.
+          patch_effects_present() {
+            case "$1" in
+              55_selinux_hook_hide_susfs_artifacts.patch)
+                grep -q 'susfs_is_avc_log_spoofing_enabled' fs/proc/array.c &&
+                grep -q 'susfs_is_avc_log_spoofing_enabled' security/selinux/avc.c ;;
+              56_selinuxfs_hide_sensitive_av.patch)
+                grep -q 'susfs_is_avc_log_spoofing_enabled' security/selinux/selinuxfs.c &&
+                grep -q 'fsck_untrusted' security/selinux/selinuxfs.c ;;
+              *) return 1 ;;
+            esac
+          }
+
           # 4) Kernel-side SUSFS patches. Steady state manages only the owner's
-          #    55/56 custom patches, with a strict tri-state check:
-          #    forward-appliable -> apply; reverse-appliable -> already applied;
-          #    neither -> tree/patch drift, abort (owner rule: any conflict or
-          #    structural surprise -> abort, push nothing, open an issue).
-          #    The upstream-style 50 patch belongs to the bootstrap path only:
-          #    on the v2.3.0 tree it can neither apply nor reverse, and silently
-          #    treating that as "already applied" would hide real drift.
+          #    55/56 custom patches. The kernel tree is the source of truth and
+          #    evolves directly (e.g. 56 was applied on 2026-08-24 and the tree
+          #    has moved beyond the exported patch), so a byte-exact reverse
+          #    check is wrong: instead use a tri-state - forward-appliable
+          #    (apply), net-effect markers present in the tree (skip), and
+          #    anything else aborts per the owner rule (conflict/structural
+          #    surprise -> abort, push nothing, open an issue).
+          #    The upstream-style 50 patch belongs to the bootstrap path only.
           APPLIED=0
           PATCHES=(55_selinux_hook_hide_susfs_artifacts.patch \
                    56_selinuxfs_hide_sensitive_av.patch)
@@ -153,10 +170,10 @@ jobs:
               echo "$p: not applied yet -> applying"
               git apply "$KP/$p" || { echo "::error::$p failed to apply"; exit 1; }
               APPLIED=1
-            elif git apply --reverse --check "$KP/$p" 2>/dev/null; then
-              echo "$p: already applied -> skipping"
+            elif patch_effects_present "$p"; then
+              echo "$p: net effect present in tree -> skipping"
             else
-              echo "::error::$p can neither be applied nor reversed - tree/patch mismatch, aborting"
+              echo "::error::$p can neither be applied nor is its net effect present - tree/patch mismatch, aborting"
               exit 1
             fi
           done
