@@ -1,6 +1,7 @@
-> 📚 本篇收录两篇指南（可用 TOC 快速跳转）：
+> 📚 本篇收录三篇指南（可用 TOC 快速跳转）：
 > - [① 生成 .config 的经验指南（编译：defconfig + gki_defconfig / clang22）](#guide-config)
 > - [② ReSukiSU-SUSFS 落地内核树指南：头文件重建与版本号计算](#guide-susfs)
+> - [③ 使用 GitHub Actions 工作流编译内核（免本地环境）](#guide-ci)
 
 <a name="guide-config"></a>
 
@@ -275,4 +276,53 @@ grep -n 'KSU_VERSION\|KSU_LOCAL_VERSION\|KSU_TAG_NAME\|KSU_COMMIT_SHA\|KSU_BRANC
 | KSU_VERSION（固定值） | `35127` |
 | 落地提交 | `a5724993c054` |
 
-> 最后更新：2026-09-10
+> 最后更新：2026-09-13
+
+---
+
+<a name="guide-ci"></a>
+
+# ③ 使用 GitHub Actions 工作流编译内核（免本地环境）
+
+**你可以使用工作流编译内核！** 不需要本地 WSL、工具链和几十 GB 源码：仓库自带的
+`.github/workflows/build-kernel.yml` 在云端完成 clang-r596125 全量编译、lz4 legacy
+打包和 ReSukiSU 管理器配对下载，产物下载即用。
+
+## 触发方式
+
+- 网页：仓库 **Actions** → 左侧选 **build-kernel** → **Run workflow** → 分支保持
+  `bsp-rodin-v-oss-bp` → 点击运行；
+- 命令行：`gh workflow run build-kernel.yml -R omajili-manbu/Xiaomi_Rodin_Kernel_Enhance --ref bsp-rodin-v-oss-bp`
+
+该工作流为 `workflow_dispatch` 手动触发，不会因 push 或 schedule 自动运行。
+
+## 它在云端做什么
+
+1. 下载 AOSP 预编译 clang-r596125（googlesource `mirror-goog-main-llvm-toolchain-source`
+   分支 tarball，失败自动回退固定 commit 直链 / sparse clone）；
+2. 按指南①的结论生成配置：`make ARCH=arm64 LLVM=1 gki_defconfig`（只用 gki_defconfig），
+   然后 `make ARCH=arm64 LLVM=1 -j"$(nproc)" Image Image.lz4`；
+3. 校验 `Image.lz4` 魔数为 `02214c18`（LZ4 legacy）；若不是则自动用 `lz4 -l` 重压并复检；
+4. 组装 AnyKernel3（WildKernels gki-2.0）：内核 blob 命名为 `Image`（设备只认这个名字），
+   内容为 lz4 legacy 压缩的内核，并写入版本号到 kernel.string；
+5. 从 ReSukiSU 上游 main 的 Build Manager CI 中，取与内核树 `drivers/kernelsu/Kbuild`
+   固定的 `KSU_COMMIT_SHA` **相同 commit** 的构建产物（管理器与内核模块版本严格一致），
+   过滤后只保留 arm64-v8a 的 release 与 spoofed 两个 APK。
+
+## 产物（run 页底部 3 个 artifact）
+
+| Artifact | 内容与用法 |
+|---|---|
+| `Rodin-<版本>-AnyKernel3` | 可刷包本体。下载得到的 zip 就是 AK3 包（根目录 `anykernel.sh` / `Image` / `META-INF/`），TWRP/KernelSU 直接选中刷入，**无需先解包** |
+| `rodin-<版本>-manager` | ReSukiSU 管理器 release 变体（arm64-v8a 单 APK） |
+| `rodin-<版本>-manager-spoofed` | ReSukiSU 管理器 spoofed 变体（arm64-v8a 单 APK） |
+
+## 注意
+
+- 全量 ThinLTO 编译约 35–45 分钟（4 核 runner），任一步失败即中止，日志可直接定位到具体步骤；
+- 管理器版本一致性：按 `KSU_COMMIT_SHA` 精确匹配上游 CI run；若对应产物已过期（GitHub
+  默认保留 90 天），自动回退到上游最新成功构建并在日志中 `::warning` 提示；
+- 与每日 `sync-resukisu` 互补：sync 落地新 ReSukiSU 后，手动触发一次构建即可得到
+  新版本内核 + 配套管理器。
+
+> 最后更新：2026-09-13
